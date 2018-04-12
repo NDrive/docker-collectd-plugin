@@ -21,10 +21,11 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-# Requirements: docker-py
+# Requirements: docker
 
 import dateutil.parser
 import docker
+import json
 import jsonpath_rw
 import logging
 import os
@@ -33,9 +34,11 @@ import sys
 import threading
 import time
 from calendar import timegm
+from datetime import datetime
 from distutils.version import StrictVersion
 
 COLLECTION_INTERVAL = 10
+DEFAULT_SHARES = 1024
 
 
 def _c(c):
@@ -185,24 +188,44 @@ def read_cpu_stats(container, dimensions, stats, t):
 
     # CPU Percentage based on calculateCPUPercent Docker method
     # https://github.com/docker/docker/blob/master/api/client/stats.go
+    cpu_percent = get_cpu_percent(stats)
+    emit(container, dimensions, 'cpu.percent', [cpu_percent], t=t)
+
+
+def get_cpu_percent(stats):
     cpu_percent = 0.0
+    cpu_usage = stats['cpu_stats']['cpu_usage']
     if 'precpu_stats' in stats:
         precpu_stats = stats['precpu_stats']
         precpu_usage = precpu_stats['cpu_usage']
+        percpu = cpu_usage['percpu_usage']
         cpu_delta = cpu_usage['total_usage'] - precpu_usage['total_usage']
-        system_delta = system_cpu_usage - precpu_stats['system_cpu_usage']
-        if system_delta > 0 and cpu_delta > 0:
-            cpu_percent = 100.0 * cpu_delta / system_delta * len(percpu)
-    emit(container, dimensions, "cpu.percent", [cpu_percent], t=t)
+        # Sometimes system_cpu_usage is not in cpu_stats (when there's load)
+        if 'system_cpu_usage' in stats['cpu_stats']:
+            system_cpu_usage = stats['cpu_stats']['system_cpu_usage']
+            if 'system_cpu_usage' in precpu_stats:
+                pre_system_cpu_usage = precpu_stats['system_cpu_usage']
+                system_delta = float(system_cpu_usage - pre_system_cpu_usage)
+                if system_delta > 0 and cpu_delta > 0:
+                    cpu_percent = cpu_delta / system_delta * len(percpu)
+                    cpu_percent *= 100
+    return cpu_percent
 
 
 def read_network_stats(container, dimensions, stats, t):
     """Process network utilization stats for a container."""
-    net_stats = stats['network']
+    net_stats = stats['networks']
     log.info('Reading network stats: {0}'.format(net_stats))
 
-    items = sorted(net_stats.items())
-    emit(container, dimensions, 'network.usage', [x[1] for x in items], t=t)
+    for interface, if_stats in net_stats.items():
+        items = sorted(if_stats.items())
+        interface_dims = dimensions.copy()
+        interface_dims['interface'] = interface
+        emit(container,
+             interface_dims,
+             'network.usage',
+             [x[1] for x in items],
+             t=t)
 
 
 def read_memory_stats(container, dimensions, stats, t):
@@ -224,6 +247,70 @@ def read_memory_stats(container, dimensions, stats, t):
     else:
         log.notice('No detailed memory stats available from container {0}.'
                    .format(_c(container)))
+
+
+def read_cpu_shares_stats(container,
+                          container_inspect, cstats,
+                          cpu_percent, sum_of_shares):
+    # Get cpu shares used by container
+    stats = cstats.stats
+    dimensions = cstats.dimensions
+    num_cpus_host = len(stats['cpu_stats']['cpu_usage']['percpu_usage'])
+    shares_used_percent = 0.0
+    cpu_shares = container_inspect['HostConfig']['CpuShares'] or \
+        DEFAULT_SHARES
+    fraction_of_shares = cpu_shares / float(sum_of_shares)
+    shares_used_percent = cpu_percent / num_cpus_host / fraction_of_shares
+    emit(container, dimensions,
+         'cpu.shares',
+         [shares_used_percent],
+         type_instance='used.percent',
+         t=stats['read'])
+
+
+def read_cpu_quota_stats(container, container_inspect, cstats):
+    stats = cstats.stats
+    dimensions = cstats.dimensions
+    host_config = container_inspect['HostConfig']
+    cpu_quota = host_config.get('CpuQuota', 0)
+
+    if not cpu_quota:
+        return
+
+    if 'preread' in stats and 'precpu_stats' in stats:
+        period = host_config.get('CpuPeriod', 0)
+        # Default period length is 100,000
+        cpu_period = 100000 if period == 0 else period
+        preread = datetime.strptime(
+                stats['preread'][:-4],
+                "%Y-%m-%dT%H:%M:%S.%f")
+        read = datetime.strptime(
+                stats['read'][:-4],
+                "%Y-%m-%dT%H:%M:%S.%f")
+        # Time delta in ms between two reads from stats endpoint
+        delta_between_reads = total_milliseconds((read - preread))
+        cpu_total = stats['cpu_stats']['cpu_usage']['total_usage']
+        precpu_stats = stats['precpu_stats']
+        precpu_total = precpu_stats['cpu_usage']['total_usage']
+        cpu_delta = cpu_total - precpu_total
+        number_of_periods = delta_between_reads / cpu_period
+        total_quota = number_of_periods * cpu_quota
+        # cpu delta is in nano seconds, convert to milliseconds
+        quota_used_percent = 100 * cpu_delta / (total_quota * (10e5))
+        emit(container,
+             dimensions,
+             'cpu.quota',
+             [quota_used_percent],
+             type_instance='used.percent',
+             t=stats['read'])
+
+
+# total_seconds() method of datetime available only from python 2.7
+def total_milliseconds(td):
+    td_microseconds = td.microseconds + \
+                                ((td.seconds + td.days * 24 * 3600) * 10**6)
+    td_milliseconds = td_microseconds / float(10**3)
+    return td_milliseconds
 
 
 class DimensionsProvider:
@@ -318,7 +405,6 @@ class ContainerStats(threading.Thread):
         threading.Thread.__init__(self)
         self.daemon = True
         self.stop = False
-
         self._container = container
         self._client = client
         self._feed = None
@@ -342,8 +428,10 @@ class ContainerStats(threading.Thread):
         while not self.stop:
             try:
                 if not self._feed:
+                    # Defer decoding until stats are needed to save CPU
                     self._feed = self._client.stats(self._container,
-                                                    decode=True)
+                                                    stream=True,
+                                                    decode=False)
                 self._stats = self._feed.next()
 
                 # Reset failure count on successful read from the stats API.
@@ -375,7 +463,7 @@ class ContainerStats(threading.Thread):
         """Wait, if needed, for stats to be available and return the most
         recently read stats data, parsed as JSON, for the container."""
         if self._stats:
-            return self._stats
+            return json.loads(self._stats)
         return None
 
 
@@ -388,8 +476,9 @@ class DockerPlugin:
     DEFAULT_BASE_URL = 'unix://var/run/docker.sock'
     DEFAULT_DOCKER_TIMEOUT = 5
 
-    # The stats endpoint is only supported by API >= 1.17
-    MIN_DOCKER_API_VERSION = '1.17'
+    # The new docker package only supports 1.21+.
+    MIN_DOCKER_API_VERSION = '1.21'
+    MIN_DOCKER_API_STRICT_VERSION = StrictVersion(MIN_DOCKER_API_VERSION)
 
     # TODO: add support for 'networks' from API >= 1.20 to get by-iface stats.
     METHODS = [read_network_stats, read_blkio_stats, read_cpu_stats,
@@ -404,6 +493,9 @@ class DockerPlugin:
         self.excluded_images = []
         self.excluded_names = []
         self.stats = {}
+        self.cpu_quota_bool = False
+        self.cpu_shares_bool = False
+        self.collect_network_stats = True
 
     def is_excluded_label(self, container):
         """
@@ -502,6 +594,12 @@ class DockerPlugin:
                     handle.verbose = str_to_bool(node.values[0])
                 elif node.key == 'Interval':
                     COLLECTION_INTERVAL = int(node.values[0])
+                elif node.key == 'CpuQuotaPercent':
+                    self.cpu_quota_bool = str_to_bool(node.values[0])
+                elif node.key == 'CpuSharesPercent':
+                    self.cpu_shares_bool = str_to_bool(node.values[0])
+                elif node.key == 'CollectNetworkStats':
+                    self.collect_network_stats = str_to_bool(node.values[0])
                 elif (node.key == 'ExcludeName' or
                       node.key == 'ExcludeImage' or
                       node.key == 'ExcludeLabel'):
@@ -536,7 +634,7 @@ class DockerPlugin:
         self.dimensions = DimensionsProvider(specs)
 
     def init_callback(self):
-        self.client = docker.Client(
+        self.client = docker.APIClient(
             base_url=self.docker_url,
             version=DockerPlugin.MIN_DOCKER_API_VERSION)
         self.client.timeout = self.timeout
@@ -544,18 +642,21 @@ class DockerPlugin:
         try:
             version = self.client.version()['ApiVersion']
         except IOError, e:
-            log.exception(('Unable to access Docker daemon at {url} '
-                           'This may indicate SELinux problems. : {error}')
-                          .format(url=self.docker_url,
-                                  error=e))
-            return False
+            # Log a warning if connection is not established
+            collectd.warning((
+                    'Unable to access Docker daemon at {url} in \
+                    init_callback. Will try in read_callback.'
+                    'This may indicate SELinux problems. : {error}')
+                    .format(url=self.docker_url, error=e))
+
+            collectd.register_read(
+                    self.read_callback,
+                    interval=COLLECTION_INTERVAL)
+
+            return True
 
         # Check API version for stats endpoint support.
-        if StrictVersion(version) < \
-                StrictVersion(DockerPlugin.MIN_DOCKER_API_VERSION):
-            log.error(('Docker daemon at {url} does not '
-                       'support container statistics!')
-                      .format(url=self.docker_url))
+        if not self.check_version(version):
             return False
 
         collectd.register_read(self.read_callback,
@@ -567,7 +668,31 @@ class DockerPlugin:
                            timeout=self.timeout))
         return True
 
+    # Method to compare docker version with min version required
+    def check_version(self, version):
+        if StrictVersion(version) < \
+                DockerPlugin.MIN_DOCKER_API_STRICT_VERSION:
+            log.error(('Docker daemon at {url} does not '
+                       'support container statistics!')
+                      .format(url=self.docker_url))
+            return False
+        return True
+
     def read_callback(self):
+        try:
+            version = self.client.version()['ApiVersion']
+        except IOError, e:
+            # Log a warning if connection is not established
+            log.exception(('Unable to access Docker daemon at {url}. '
+                           'This may indicate SELinux problems. : {error}')
+                          .format(url=self.docker_url,
+                                  error=e))
+            return
+
+        # Check API version for stats endpoint support.
+        if not self.check_version(version):
+            return
+
         try:
             containers = [c for c in self.client.containers()
                           if c['Status'].startswith('Up')]
@@ -593,10 +718,10 @@ class DockerPlugin:
                      .format(_c(self.stats[cid]._container)))
             del self.stats[cid]
 
+        containers_state = []
         for container in containers:
             try:
                 container['Name'] = self._container_name(container['Names'])
-
                 # Start a stats gathering thread if the container is new.
                 if container['Id'] not in self.stats:
                     if self.is_excluded(container):
@@ -606,19 +731,63 @@ class DockerPlugin:
                                        self.client)
 
                 cstats = self.stats[container['Id']]
-                stats = cstats.stats
+                stats = cstats.stats if cstats else None
                 read_at = stats.get('read') if stats else None
                 if not read_at:
                     # No stats available yet; skipping container.
                     continue
-
                 # Process stats through each reader.
                 for method in self.METHODS:
-                    method(container, cstats.dimensions, stats, read_at)
+                    if not self.collect_network_stats and method == read_network_stats:
+                        continue
+                    try:
+                        method(container, cstats.dimensions, stats, read_at)
+                    except Exception, e:
+                        log.exception(('Unable to retrieve {method} stats '
+                                       'for container {container}: {msg}')
+                                      .format(
+                                            method=method.__name__,
+                                            container=_c(container),
+                                            msg=e))
+
+                # If CPU shares or quota metrics are required
+                if self.cpu_shares_bool or self.cpu_quota_bool:
+                    try:
+                        # Get cgroup info container by inspecting the container
+                        container_inspect = self.client \
+                                                .inspect_container(container)
+                        containers_state.append({
+                                    'container': container,
+                                    'container_inspect': container_inspect})
+                    except Exception, e:
+                        log.exception(('Unable to retrieve cpu share and quota'
+                                       ' stats for {container}: {msg}').format(
+                                           container=_c(container), msg=e))
+
             except Exception, e:
                 log.exception(('Unable to retrieve stats for container '
                                '{container}: {msg}')
                               .format(container=_c(container), msg=e))
+        if self.cpu_shares_bool:
+            sum_of_shares = reduce(
+                lambda a, b: a + (
+                    b['container_inspect']['HostConfig']['CpuShares'] or 1024),
+                containers_state,
+                0)
+
+        for state in containers_state:
+            container = state['container']
+            inspect = state['container_inspect']
+            cstats = self.stats[container['Id']]
+            cpu_percent = get_cpu_percent(cstats.stats)
+            if self.cpu_quota_bool:
+                read_cpu_quota_stats(container, inspect, cstats)
+            if self.cpu_shares_bool:
+                read_cpu_shares_stats(container,
+                                      inspect,
+                                      cstats,
+                                      cpu_percent,
+                                      sum_of_shares)
 
     def stop_all(self):
         for stat_thread in self.stats.values():
