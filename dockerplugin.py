@@ -95,8 +95,8 @@ def emit(container, dimensions, point_type, value, t=None,
     val.interval = COLLECTION_INTERVAL
 
     # Add additional extracted dimensions through plugin_instance.
-    # if dimensions:
-    #     val.plugin_instance += '[{dims}]'.format(dims=_d(dimensions))
+    if dimensions:
+        val.plugin_instance += '[{dims}]'.format(dims=_d(dimensions))
 
     if point_type:
         val.type = point_type
